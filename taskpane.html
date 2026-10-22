@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thread Notities</title>
+<script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1f1f1f; --muted: #6b6b6b; --line: #e3e3e3;
+    --accent: #2b4c7e; --note-bg: #fffbe6; --note-line: #f0e2a0; --danger: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #1f1f1f; --fg: #f0f0f0; --muted: #a8a8a8; --line: #3a3a3a;
+      --accent: #8fb3ea; --note-bg: #2b2a22; --note-line: #4a4632; --danger: #f2a49e; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--fg);
+    font: 14px/1.45 -apple-system, "Segoe UI", system-ui, sans-serif;
+    display: flex; flex-direction: column; }
+  .tabs { display: flex; border-bottom: 1px solid var(--line); }
+  .tab { flex: 1; background: none; border: 0; padding: 10px 6px; color: var(--muted);
+    font: inherit; cursor: pointer; border-bottom: 2px solid transparent; }
+  .tab.active { color: var(--fg); border-bottom-color: var(--accent); font-weight: 600; }
+  main { flex: 1; display: flex; flex-direction: column; min-height: 0; padding: 12px; }
+  section { flex: 1; display: flex; flex-direction: column; min-height: 0; gap: 8px; }
+  [hidden] { display: none !important; }
+  .subject { font-weight: 600; font-size: 13px; color: var(--muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  textarea { flex: 1; min-height: 160px; resize: none; width: 100%;
+    background: var(--note-bg); color: var(--fg); border: 1px solid var(--note-line);
+    border-radius: 8px; padding: 10px; font: inherit; outline: none; }
+  textarea:focus { border-color: var(--accent); }
+  .footer { display: flex; justify-content: space-between; align-items: center;
+    font-size: 12px; color: var(--muted); }
+  .footer .error, #usage.error { color: var(--danger); }
+  button.link { background: none; border: 0; padding: 2px 4px; font: inherit;
+    color: var(--muted); cursor: pointer; }
+  button.link:hover { text-decoration: underline; }
+  button.danger { color: var(--danger); }
+  input[type=search] { width: 100%; padding: 8px 10px; border: 1px solid var(--line);
+    border-radius: 8px; font: inherit; background: var(--bg); color: var(--fg); }
+  ul { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
+  li { border-bottom: 1px solid var(--line); padding: 8px 2px; display: flex; gap: 6px; }
+  li .body { flex: 1; min-width: 0; cursor: pointer; }
+  li .t { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  li .d { font-size: 12px; color: var(--muted); }
+  li .s { font-size: 13px; color: var(--muted); display: -webkit-box;
+    -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; white-space: pre-wrap; }
+  li.current .t { color: var(--accent); }
+  #usage { font-size: 12px; color: var(--muted); }
+  .empty { color: var(--muted); text-align: center; padding: 24px 8px; }
+</style>
+</head>
+<body>
+  <div class="tabs">
+    <button id="tab-note" class="tab active">Deze thread</button>
+    <button id="tab-all" class="tab">Alle notities <span id="count"></span></button>
+  </div>
+  <main>
+    <section id="view-note">
+      <div id="no-item" class="empty" hidden>Selecteer een e-mail om de notities te zien.</div>
+      <div id="subject" class="subject"></div>
+      <textarea id="note" placeholder="Typ hier je aantekeningen voor deze thread… Ze worden automatisch opgeslagen."></textarea>
+      <div class="footer">
+        <span id="status"></span>
+        <button id="delete" class="link danger" title="Notitie van deze thread wissen">Wissen</button>
+      </div>
+    </section>
+    <section id="view-all" hidden>
+      <input id="search" type="search" placeholder="Zoeken in notities…">
+      <ul id="list"></ul>
+      <div id="usage"></div>
+    </section>
+  </main>
+
+<script>
+(function () {
+  "use strict";
+  var KEY = "notes";              // één instelling met alle notities
+  var LIMIT = 32 * 1024;          // limiet van Outlook roaming settings
+  var currentKey = null, currentMeta = null, dirty = false, timer = null;
+  var $ = function (id) { return document.getElementById(id); };
+  var noteEl = $("note");
+
+  // Korte, stabiele sleutel per thread (64-bit FNV-1a in twee delen)
+  function hash(str) {
+    var h1 = 0x811c9dc5, h2 = 0x01000193 ^ 0x5bd1e995;
+    for (var i = 0; i < str.length; i++) {
+      var c = str.charCodeAt(i);
+      h1 = Math.imul(h1 ^ c, 0x01000193);
+      h2 = Math.imul(h2 ^ c, 0x5bd1e995);
+    }
+    return (h1 >>> 0).toString(36) + (h2 >>> 0).toString(36);
+  }
+
+  function settings() { return Office.context.roamingSettings; }
+  function readAll() {
+    var n = settings().get(KEY);
+    return n && typeof n === "object" ? JSON.parse(JSON.stringify(n)) : {};
+  }
+  function fmtTime(ms) {
+    var d = new Date(ms), now = new Date();
+    var t = d.toLocaleTimeString("nl-NL", { hour: "2-digit", minute: "2-digit" });
+    return d.toDateString() === now.toDateString() ? "vandaag " + t
+      : d.toLocaleDateString("nl-NL", { day: "numeric", month: "short", year: "numeric" }) + " " + t;
+  }
+  function setStatus(text, isError) {
+    $("status").textContent = text;
+    $("status").className = isError ? "error" : "";
+  }
+
+  function persist(notes, onDone) {
+    var size = JSON.stringify(notes).length;
+    if (size > LIMIT - 1500) {
+      setStatus("Opslag bijna vol – wis oude notities via ‘Alle notities’.", true);
+      return false;
+    }
+    settings().set(KEY, notes);
+    settings().saveAsync(function (r) {
+      if (r.status === Office.AsyncResultStatus.Succeeded) { onDone && onDone(); }
+      else { dirty = true; setStatus("Opslaan mislukt: " + r.error.message, true); }
+      updateCount();
+    });
+    return true;
+  }
+
+  function saveNow() {
+    clearTimeout(timer);
+    if (!dirty || !currentKey) return;
+    var notes = readAll();
+    var text = noteEl.value;
+    if (text.trim() === "") delete notes[currentKey];
+    else notes[currentKey] = { t: text, s: currentMeta.subject, u: Date.now(), id: currentMeta.itemId };
+    dirty = false;
+    setStatus("Opslaan…");
+    persist(notes, function () {
+      setStatus(text.trim() === "" ? "" : "Opgeslagen " + fmtTime(Date.now()));
+    });
+  }
+
+  function loadItem() {
+    var item = Office.context.mailbox.item;
+    if (!item || !item.conversationId) {
+      currentKey = null; currentMeta = null;
+      $("no-item").hidden = false;
+      $("subject").hidden = noteEl.hidden = true;
+      $("delete").hidden = true; setStatus("");
+      return;
+    }
+    $("no-item").hidden = true;
+    $("subject").hidden = noteEl.hidden = false; $("delete").hidden = false;
+    var subject = (item.normalizedSubject || item.subject || "(geen onderwerp)").slice(0, 100);
+    currentKey = hash(item.conversationId);
+    currentMeta = { subject: subject, itemId: item.itemId };
+    $("subject").textContent = subject;
+    $("subject").title = subject;
+    var n = readAll()[currentKey];
+    noteEl.value = n ? n.t : "";
+    setStatus(n ? "Laatst bijgewerkt " + fmtTime(n.u) : "");
+    dirty = false;
+    if (!$("view-all").hidden) renderList();
+  }
+
+  function updateCount() {
+    var c = Object.keys(readAll()).length;
+    $("count").textContent = c ? "(" + c + ")" : "";
+  }
+
+  function renderList() {
+    var notes = readAll(), q = $("search").value.trim().toLowerCase();
+    var keys = Object.keys(notes).sort(function (a, b) { return notes[b].u - notes[a].u; });
+    var ul = $("list"); ul.innerHTML = "";
+    var shown = 0;
+    keys.forEach(function (k) {
+      var n = notes[k];
+      if (q && (n.s + " " + n.t).toLowerCase().indexOf(q) === -1) return;
+      shown++;
+      var li = document.createElement("li");
+      if (k === currentKey) li.className = "current";
+      var body = document.createElement("div"); body.className = "body";
+      body.title = "Open deze e-mail";
+      var t = document.createElement("div"); t.className = "t"; t.textContent = n.s;
+      var d = document.createElement("div"); d.className = "d"; d.textContent = fmtTime(n.u);
+      var s = document.createElement("div"); s.className = "s"; s.textContent = n.t;
+      body.append(t, d, s);
+      body.onclick = function () {
+        if (n.id) {
+          try { Office.context.mailbox.displayMessageForm(n.id); }
+          catch (e) { /* bericht mogelijk verplaatst of verwijderd */ }
+        }
+      };
+      var del = document.createElement("button");
+      del.className = "link danger"; del.textContent = "×"; del.title = "Notitie wissen";
+      del.onclick = function () {
+        if (!confirmDelete(n.s)) return;
+        var all = readAll(); delete all[k];
+        persist(all, function () { if (k === currentKey) { noteEl.value = ""; setStatus(""); } renderList(); });
+      };
+      li.append(body, del); ul.appendChild(li);
+    });
+    if (!shown) {
+      var e = document.createElement("li"); e.className = "empty";
+      e.textContent = q ? "Geen notities gevonden." : "Nog geen notities.";
+      ul.appendChild(e);
+    }
+    var pct = Math.round(JSON.stringify(notes).length / LIMIT * 100);
+    $("usage").textContent = "Opslag gebruikt: " + pct + "%";
+    $("usage").className = pct > 85 ? "error" : "";
+  }
+
+  // Twee keer klikken om te wissen (pop-ups werken niet betrouwbaar in Outlook)
+  var pendingDelete = null;
+  function confirmDelete(label) {
+    var now = Date.now();
+    if (pendingDelete && pendingDelete.label === label && now - pendingDelete.at < 4000) {
+      pendingDelete = null; return true;
+    }
+    pendingDelete = { label: label, at: now };
+    setStatus("Klik nog een keer om te wissen.", true);
+    return false;
+  }
+
+  function showTab(which) {
+    $("tab-note").classList.toggle("active", which === "note");
+    $("tab-all").classList.toggle("active", which === "all");
+    $("view-note").hidden = which !== "note";
+    $("view-all").hidden = which !== "all";
+    if (which === "all") { saveNow(); renderList(); }
+  }
+
+  Office.onReady(function () {
+    noteEl.addEventListener("input", function () {
+      dirty = true; setStatus("…");
+      clearTimeout(timer); timer = setTimeout(saveNow, 800);
+    });
+    noteEl.addEventListener("blur", saveNow);
+    window.addEventListener("pagehide", saveNow);
+    $("delete").onclick = function () {
+      if (!currentKey || !confirmDelete("current")) return;
+      noteEl.value = ""; dirty = true; saveNow();
+    };
+    $("tab-note").onclick = function () { showTab("note"); };
+    $("tab-all").onclick = function () { showTab("all"); };
+    $("search").addEventListener("input", renderList);
+
+    if (Office.context.mailbox.addHandlerAsync) {
+      Office.context.mailbox.addHandlerAsync(Office.EventType.ItemChanged, function () {
+        saveNow(); loadItem();
+      });
+    }
+    loadItem();
+    updateCount();
+  });
+})();
+</script>
+</body>
+</html>
